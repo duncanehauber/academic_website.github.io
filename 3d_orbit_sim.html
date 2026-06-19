@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+
+<html>
+<head>
+	<title>3-body Orbit Simulation (3D)</title>
+	<style>
+		body {
+			background: #0b0e17;
+			color: #d0d6e8;
+			font-family: sans-serif;
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+		}
+		canvas {
+			background: #060810;
+			border: 1px solid #2a3150;
+			border-radius: 4px;
+			cursor: grab;
+			max-width: 100%;
+			height: auto;
+		}
+		canvas:active { cursor: grabbing; }
+		p { color: #6b7494; font-size: 13px; }
+
+		#setup-panel {
+			background: #10141f;
+			border: 1px solid #2a3150;
+			border-radius: 6px;
+			padding: 16px 18px;
+			max-width: calc(100vw - 40px);
+			overflow-x: auto;
+			box-sizing: border-box;
+		}
+		#setup-panel table {
+			border-collapse: collapse;
+		}
+		#setup-panel th, #setup-panel td {
+			padding: 4px 6px;
+			font-size: 13px;
+			text-align: center;
+		}
+		#setup-panel th { color: #6b7494; font-weight: normal; }
+		.body-label { font-weight: bold; text-align: left; }
+		.group-divider { border-left: 1px solid #2a3150; }
+		input[type="number"] {
+			width: 58px;
+			background: #060810;
+			color: #d0d6e8;
+			border: 1px solid #2a3150;
+			border-radius: 3px;
+			padding: 4px;
+			font-size: 13px;
+		}
+		input[type="number"]:focus { outline: 1px solid #5577cc; }
+		button {
+			background: #24437e;
+			color: #e6ecff;
+			border: none;
+			border-radius: 4px;
+			padding: 8px 18px;
+			font-size: 14px;
+			cursor: pointer;
+			margin-top: 14px;
+		}
+		button:hover { background: #2f56a0; }
+		.setup-row {
+			display: flex;
+			align-items: center;
+			gap: 24px;
+		}
+		label.checkbox {
+			font-size: 13px;
+			color: #9aa4c0;
+			margin-top: 14px;
+			display: inline-flex;
+			align-items: center;
+			gap: 6px;
+		}
+		#sim-view { display: none; flex-direction: column; align-items: center; }
+		#error-msg { color: #ff7777; font-size: 13px; min-height: 18px; margin: 8px 0 0; }
+	</style>
+</head>
+
+<body>
+<h2>3-Body Orbit Simulation (3D)</h2>
+
+<div id="setup-panel">
+	<table>
+		<tr>
+			<th></th><th></th>
+			<th colspan="3" class="group-divider">Position</th>
+			<th colspan="3" class="group-divider">Velocity</th>
+		</tr>
+		<tr>
+			<th>Body</th><th>Mass</th>
+			<th class="group-divider">x</th><th>y</th><th>z</th>
+			<th class="group-divider">v<sub>x</sub></th><th>v<sub>y</sub></th><th>v<sub>z</sub></th>
+		</tr>
+		<tbody id="body-rows"></tbody>
+	</table>
+	<div class="setup-row">
+		<button id="start-btn">Start Simulation</button>
+		<label class="checkbox">
+			<input type="checkbox" id="zero-momentum" checked>
+			Zero net momentum (keeps system centered)
+		</label>
+	</div>
+	<p id="error-msg"></p>
+	<p>Units: G = 1. Defaults are a circular binary (red/blue) with a lighter
+	third body (yellow) on a 50&deg;-inclined orbit.</p>
+</div>
+
+<div id="sim-view">
+	<canvas id="orbit-space" width="700" height="600"></canvas>
+	<p>Drag to rotate &middot; scroll to zoom &middot; camera auto-orbits when idle</p>
+	<button id="edit-btn">&#8592; Edit starting conditions</button>
+</div>
+
+<script>
+
+const canvas = document.getElementById("orbit-space");
+const ctx = canvas.getContext("2d");
+
+class Vec3 {
+	constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
+	add(v)   { return new Vec3(this.x + v.x, this.y + v.y, this.z + v.z); }
+	sub(v)   { return new Vec3(this.x - v.x, this.y - v.y, this.z - v.z); }
+	scale(s) { return new Vec3(this.x * s, this.y * s, this.z * s); }
+	get magnitude() { return Math.sqrt(this.x ** 2 + this.y ** 2 + this.z ** 2); }
+}
+
+const G = 1;
+const dt = 0.001;          // integration step (simulation units)
+const stepsPerFrame = 10;  // sub-steps per rendered frame
+const softening = 0.01;    // avoids singular forces at close encounters
+const TRAIL_LENGTH = 900;
+
+// Defaults: circular binary in the xy-plane plus a lighter third body
+// on a 50-degree-inclined orbit around the pair.
+const inclination = 50 * Math.PI / 180;
+const v3mag = Math.sqrt(G * 2 / 2.5);
+
+const bodyMeta = [
+	{ name: "Body 1", color: "#ff5555", size: 7 },
+	{ name: "Body 2", color: "#55aaff", size: 7 },
+	{ name: "Body 3", color: "#ffd24d", size: 4 }
+];
+
+const defaults = [
+	{ m: 1,    r: [-0.5, 0, 0], v: [0, -Math.sqrt(0.5), 0] },
+	{ m: 1,    r: [ 0.5, 0, 0], v: [0,  Math.sqrt(0.5), 0] },
+	{ m: 0.05, r: [ 2.5, 0, 0], v: [0, v3mag * Math.cos(inclination), v3mag * Math.sin(inclination)] }
+];
+
+let bodies = [];
+
+// ---- Setup form ----
+const fields = ["m", "rx", "ry", "rz", "vx", "vy", "vz"];
+
+function buildForm() {
+	const tbody = document.getElementById("body-rows");
+	tbody.innerHTML = "";
+	for (let i = 0; i < 3; i++) {
+		const d = defaults[i];
+		const values = {
+			m: d.m,
+			rx: d.r[0], ry: d.r[1], rz: d.r[2],
+			vx: d.v[0], vy: d.v[1], vz: d.v[2]
+		};
+		const tr = document.createElement("tr");
+
+		const label = document.createElement("td");
+		label.className = "body-label";
+		label.textContent = bodyMeta[i].name;
+		label.style.color = bodyMeta[i].color;
+		tr.appendChild(label);
+
+		for (const f of fields) {
+			const td = document.createElement("td");
+			if (f === "rx" || f === "vx") td.className = "group-divider";
+			const input = document.createElement("input");
+			input.type = "number";
+			input.step = "any";
+			input.id = `b${i}-${f}`;
+			input.value = parseFloat(values[f].toFixed(5));
+			td.appendChild(input);
+			tr.appendChild(td);
+		}
+		tbody.appendChild(tr);
+	}
+}
+
+function readForm() {
+	const result = [];
+	for (let i = 0; i < 3; i++) {
+		const get = f => {
+			const raw = document.getElementById(`b${i}-${f}`).value.trim();
+			const val = parseFloat(raw);
+			if (raw === "" || !isFinite(val)) {
+				throw new Error(`${bodyMeta[i].name}: "${f}" is not a valid number.`);
+			}
+			return val;
+		};
+		const m = get("m");
+		if (m <= 0) throw new Error(`${bodyMeta[i].name}: mass must be positive.`);
+		result.push({
+			m: m,
+			r: new Vec3(get("rx"), get("ry"), get("rz")),
+			v: new Vec3(get("vx"), get("vy"), get("vz"))
+		});
+	}
+	return result;
+}
+
+// ---- Camera: orbiting perspective projection ----
+let yaw = 0.6;
+let pitch = 0.35;
+let camDist = 7;           // camera distance from origin (sim units)
+const focal = 4;           // perspective focal length (sim units)
+const viewScale = canvas.width / 6;
+
+let autoRotate = true;
+let idleTimer = null;
+let dragging = false, lastX = 0, lastY = 0;
+
+canvas.addEventListener("mousedown", e => {
+	dragging = true; lastX = e.clientX; lastY = e.clientY;
+	autoRotate = false;
+	clearTimeout(idleTimer);
+});
+window.addEventListener("mouseup", () => {
+	dragging = false;
+	idleTimer = setTimeout(() => { autoRotate = true; }, 3000);
+});
+window.addEventListener("mousemove", e => {
+	if (!dragging) return;
+	yaw += (e.clientX - lastX) * 0.008;
+	pitch += (e.clientY - lastY) * 0.008;
+	pitch = Math.max(-1.5, Math.min(1.5, pitch));
+	lastX = e.clientX; lastY = e.clientY;
+});
+canvas.addEventListener("wheel", e => {
+	e.preventDefault();
+	camDist *= Math.exp(e.deltaY * 0.001);
+	camDist = Math.max(1, Math.min(200, camDist));
+}, { passive: false });
+
+// Rotate a world point into camera space, then perspective-project.
+function project(p) {
+	const cy = Math.cos(yaw), sy = Math.sin(yaw);
+	const cp = Math.cos(pitch), sp = Math.sin(pitch);
+
+	const x1 = p.x * cy - p.y * sy;
+	const y1 = p.x * sy + p.y * cy;
+	const z1 = p.z;
+
+	const y2 = y1 * cp - z1 * sp;
+	const z2 = y1 * sp + z1 * cp;
+
+	const depth = camDist - y2;       // distance along the view axis
+	const persp = focal / Math.max(depth, 0.1);
+
+	return {
+		x: canvas.width / 2 + x1 * persp * viewScale,
+		y: canvas.height / 2 - z2 * persp * viewScale,
+		scale: persp,
+		depth: depth
+	};
+}
+
+// ---- Physics: velocity Verlet ----
+function acceleration(i) {
+	let a = new Vec3(0, 0, 0);
+	for (let j = 0; j < bodies.length; j++) {
+		if (j === i) continue;
+		const d = bodies[j].r.sub(bodies[i].r);
+		const dist2 = d.x ** 2 + d.y ** 2 + d.z ** 2 + softening ** 2;
+		const dist = Math.sqrt(dist2);
+		a = a.add(d.scale(G * bodies[j].m / (dist2 * dist)));
+	}
+	return a;
+}
+
+function step() {
+	const a0 = bodies.map((_, i) => acceleration(i));
+
+	for (let i = 0; i < bodies.length; i++) {
+		bodies[i].v = bodies[i].v.add(a0[i].scale(dt / 2));
+		bodies[i].r = bodies[i].r.add(bodies[i].v.scale(dt));
+	}
+
+	const a1 = bodies.map((_, i) => acceleration(i));
+	for (let i = 0; i < bodies.length; i++) {
+		bodies[i].v = bodies[i].v.add(a1[i].scale(dt / 2));
+	}
+}
+
+// ---- Rendering ----
+function drawReferenceGrid() {
+	ctx.strokeStyle = "#1c2440";
+	ctx.lineWidth = 1;
+	const ext = 3, n = 6;
+	for (let k = 0; k <= n; k++) {
+		const t = -ext + (2 * ext * k) / n;
+		const a = project(new Vec3(t, -ext, 0));
+		const b = project(new Vec3(t, ext, 0));
+		const c = project(new Vec3(-ext, t, 0));
+		const d = project(new Vec3(ext, t, 0));
+		ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+		ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.stroke();
+	}
+}
+
+function draw() {
+	ctx.clearRect(0, 0, canvas.width, canvas.height);
+	drawReferenceGrid();
+
+	for (const body of bodies) {
+		for (let k = 1; k < body.trail.length; k++) {
+			const p0 = project(body.trail[k - 1]);
+			const p1 = project(body.trail[k]);
+			const age = k / body.trail.length;
+			const depthDim = Math.min(1, p1.scale * 1.4);
+			ctx.beginPath();
+			ctx.moveTo(p0.x, p0.y);
+			ctx.lineTo(p1.x, p1.y);
+			ctx.strokeStyle = body.color;
+			ctx.globalAlpha = 0.45 * age * depthDim;
+			ctx.lineWidth = 1.5 * p1.scale;
+			ctx.stroke();
+		}
+	}
+	ctx.globalAlpha = 1;
+
+	const drawList = bodies
+		.map(body => ({ body, p: project(body.r) }))
+		.sort((a, b) => b.p.depth - a.p.depth);
+
+	for (const { body, p } of drawList) {
+		ctx.beginPath();
+		ctx.arc(p.x, p.y, Math.max(1.5, body.size * p.scale), 0, 2 * Math.PI);
+		ctx.fillStyle = body.color;
+		ctx.fill();
+	}
+}
+
+// ---- Run control ----
+let animHandle = null;
+
+function animate() {
+	for (let s = 0; s < stepsPerFrame; s++) {
+		step();
+	}
+
+	for (const body of bodies) {
+		body.trail.push(new Vec3(body.r.x, body.r.y, body.r.z));
+		if (body.trail.length > TRAIL_LENGTH) body.trail.shift();
+	}
+
+	if (autoRotate) yaw += 0.002;
+
+	draw();
+	animHandle = requestAnimationFrame(animate);
+}
+
+function startSimulation() {
+	const errorMsg = document.getElementById("error-msg");
+	let initial;
+	try {
+		initial = readForm();
+	} catch (err) {
+		errorMsg.textContent = err.message;
+		return;
+	}
+	errorMsg.textContent = "";
+
+	bodies = initial.map((b, i) => ({
+		m: b.m,
+		r: b.r,
+		v: b.v,
+		color: bodyMeta[i].color,
+		size: bodyMeta[i].size,
+		trail: []
+	}));
+
+	if (document.getElementById("zero-momentum").checked) {
+		let p = new Vec3(0, 0, 0), M = 0;
+		for (const b of bodies) { p = p.add(b.v.scale(b.m)); M += b.m; }
+		const vCom = p.scale(1 / M);
+		for (const b of bodies) b.v = b.v.sub(vCom);
+	}
+
+	// Pull the camera back far enough to frame the starting positions.
+	const maxR = Math.max(...bodies.map(b => b.r.magnitude), 1);
+	camDist = Math.max(7, maxR * 3);
+
+	document.getElementById("setup-panel").style.display = "none";
+	document.getElementById("sim-view").style.display = "flex";
+
+	animHandle = requestAnimationFrame(animate);
+}
+
+function stopSimulation() {
+	if (animHandle !== null) cancelAnimationFrame(animHandle);
+	animHandle = null;
+	document.getElementById("sim-view").style.display = "none";
+	document.getElementById("setup-panel").style.display = "block";
+}
+
+document.getElementById("start-btn").addEventListener("click", startSimulation);
+document.getElementById("edit-btn").addEventListener("click", stopSimulation);
+
+buildForm();
+
+</script>
+</body>
+</html>
